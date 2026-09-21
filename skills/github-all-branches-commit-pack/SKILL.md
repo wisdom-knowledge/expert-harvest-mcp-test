@@ -1,203 +1,112 @@
 ---
 name: github-all-branches-commit-pack
-version: 0.2.0
+version: 0.1.0
 kind: flow-skill
-tags: [github, git, commits, branches, archive]
-summary: 输入 GitHub 仓库地址，按分支导出全部可达提交历史和可恢复 Git bundle，并生成 ZIP。
+tags: [github, git, commits, trace, branches]
+summary: Clone or reuse a GitHub repository and produce an auditable commit-history pack for every branch.
 ---
 
 # GitHub All Branches Commit Pack
 
 ## 目标
 
-采集 GitHub 仓库当前可见的全部 refs/heads 分支。每个分支独立目录，包含完整可达提交历史（包括 merge 的所有父链）、作者统计和自包含 Git bundle；生成总 ZIP、清单和 SHA-256 校验文件。共同祖先在各分支中分别保留。不包含已删除或无权限访问的分支、PR 隐藏引用。bundle 包含被跟踪文件的历史内容；不下载 Git LFS 外部对象及子模块仓库。
+给定一个 GitHub 仓库 URL，采集仓库可见的本地和常见 origin 远程分支。
+每个分支写入独立目录，包含提交历史、作者、首尾 SHA、diff 统计和可验证的 YAML manifest。
+同时生成顶层 SUMMARY.md，便于按分支比较提交数量；可选地为每个分支生成 tar.gz。
 
 ## 输入
 
-- github_url：必填。https://github.com/OWNER/REPO[.git] 或 git@github.com:OWNER/REPO[.git]。未提供时向用户询问。
-- out_dir：可选，默认当前工作目录的 out。
-- 依赖：Git 与 Python 3。私有仓库使用现有 Git credential helper 或 SSH agent。
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `github_url` | 是 | HTTPS 或 `git@` Git URL；使用 shell 环境变量传入 |
+| `out_dir` | 否 | 输出及 clone 工作目录，默认当前目录下的 `out` |
+| `repo_path` | 否 | 已有仓库路径；提供后复用，不再 clone |
+| `MAKE_TARBALLS` | 否 | 设为 `1` 为每个分支生成 tar.gz，默认 `0` |
 
-## 执行步骤
+## 执行步骤（必须按序）
 
-1. 确认用户授权采集目标仓库，确认可用磁盘空间。默认采集全部当前可见分支，不限制提交数。
-2. 将下方 Python 代码保存为工作目录中的 collect.py，以参数数组调用 python3 collect.py github_url [out_dir]。不要将用户输入拼接进 shell。
-3. 脚本创建全新临时 bare 仓库，只抓取 refs/heads/*，以抓取成功后的引用为本次快照。失败立即报错，不把部分结果当作成功。
-4. 输出到新的随机命名目录；绝不覆盖或删除已有产物。分支目录使用稳定序号，原名在 manifest 和 SUMMARY 中保留，避免斜杠、大小写或字符替换造成冲突。
-5. 成功后返回 ZIP、校验文件、SUMMARY 的绝对路径，以及分支数和各分支提交数。失败只报告阶段及退出码，不转发可能带认证信息的 Git stderr；必要时由用户本地检查凭据。
+在包含 Git、awk、sed、find、date 和 tar 的环境中执行。命令会把 clone 限制在 `out_dir` 下，并拒绝危险路径。
 
-```python
-import hashlib
-import json
-import os
-from pathlib import Path
-import re
-import subprocess
-import sys
-import tempfile
-from datetime import datetime, timezone
-from zipfile import ZipFile, ZIP_DEFLATED
+```bash
+set -euo pipefail
 
-def parse_url(value):
-    patterns = (
-        r"https://github[.]com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/?",
-        r"git@github[.]com:([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)",
-    )
-    match = next((m for p in patterns if (m := re.fullmatch(p, value))), None)
-    if not match:
-        raise ValueError("Expected credential-free GitHub repository URL")
-    owner, repo = match.groups()
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-    if repo in ("", ".", ".."):
-        raise ValueError("Invalid repository name")
-    canonical = "https://github.com/" + owner + "/" + repo
-    transport = canonical + ".git"
-    if value.startswith("git@"):
-        transport = "git@github.com:" + owner + "/" + repo + ".git"
-    return canonical, transport, repo
+: "${github_url:?set github_url to an HTTPS or git@ GitHub URL}"
+out_dir="${out_dir:-"$PWD/out"}"
+MAKE_TARBALLS="${MAKE_TARBALLS:-0}"
+case "$out_dir" in /*) ;; *) out_dir="$PWD/$out_dir";; esac
+mkdir -p "$out_dir"
+repo_name="$(basename -s .git "${github_url%/}")"
+repo_name="$(printf '%s' "$repo_name" | sed 's/[^A-Za-z0-9._-]/_/g')"
+repo_root="$out_dir/.repos/$repo_name"
 
-def digest(path):
-    result = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            result.update(block)
-    return result.hexdigest()
+if [[ -n "${repo_path:-}" ]]; then
+  [[ -d "$repo_path/.git" ]] || { echo "repo_path is not a Git repository" >&2; exit 1; }
+  repo_root="$(cd "$repo_path" && pwd -P)"
+else
+  mkdir -p "$out_dir/.repos"
+  if [[ -d "$repo_root/.git" ]]; then
+    git -C "$repo_root" fetch --all --prune
+  else
+    git clone --no-single-branch "$github_url" "$repo_root"
+  fi
+fi
 
-def write_json(path, data):
-    path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n",
-                    encoding="utf-8")
+git -C "$repo_root" fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune 2>/dev/null || true
+pack_root="$out_dir/$repo_name"
+branches_root="$pack_root/branches"
+mkdir -p "$branches_root"
+branches=()
+while IFS= read -r branch_name; do
+  [[ -n "$branch_name" ]] && branches+=("$branch_name")
+done < <(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin | sed 's#^origin/##' | sed '/^HEAD$/d' | sort -u)
+[[ "${#branches[@]}" -gt 0 ]] || { echo "No branches found" >&2; exit 1; }
 
-def run_git(repo, *args, output=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1")
-    command = ["git", "-c", "core.hooksPath=/dev/null"]
-    if repo is not None:
-        command += ["-C", str(repo)]
-    result = subprocess.run(
-        command + list(args), env=env,
-        stdout=output if output is not None else subprocess.PIPE,
-        stderr=subprocess.PIPE, check=False,
-    )
-    if result.returncode:
-        raise RuntimeError("Git stage " + args[0] + " failed (exit "
-                           + str(result.returncode) + "); no complete archive")
-    return result.stdout if output is None else b""
-
-def collect(url, out):
-    canonical, transport, repo_name = parse_url(url)
-    out = Path(out).expanduser()
-    if ".." in out.parts:
-        raise ValueError("Output path must not contain ..")
-    out.mkdir(parents=True, exist_ok=True)
-    out = out.resolve()
-    with tempfile.TemporaryDirectory(prefix="github-history-") as temp:
-        bare = Path(temp) / "repo.git"
-        run_git(None, "init", "--bare", str(bare))
-        run_git(bare, "fetch", "--no-tags", transport,
-                "+refs/heads/*:refs/heads/*")
-        refs = run_git(bare, "for-each-ref", "--sort=refname",
-                       "--format=%(refname)", "refs/heads/").decode("utf-8").splitlines()
-        if not refs:
-            raise ValueError("Repository has no visible branches")
-        if run_git(bare, "rev-parse", "--is-shallow-repository").strip() != b"false":
-            raise RuntimeError("Incomplete shallow history")
-        # A fresh directory makes retries non-destructive.
-        run_dir = Path(tempfile.mkdtemp(prefix=repo_name + "-", dir=out))
-        pack = run_dir / "history"
-        branches = pack / "branches"
-        branches.mkdir(parents=True)
-        records = []
-        for index, ref in enumerate(refs, 1):
-            name = ref[len("refs/heads/"):]
-            folder = "branch-" + str(index).zfill(6)
-            dest = branches / folder
-            dest.mkdir()
-            tip = run_git(bare, "rev-parse", "--verify", ref).decode().strip()
-            count = int(run_git(bare, "rev-list", "--count", tip))
-            roots = run_git(bare, "rev-list", "--max-parents=0", tip).decode().splitlines()
-            exports = {
-                "commits.full.txt": ["log", "--no-decorate", "--format=fuller",
-                                     "--date=iso-strict", tip],
-                "commits.oneline.txt": ["log", "--no-decorate", "--format=%H %s", tip],
-                "commits.sha.txt": ["rev-list", tip],
-                "authors.txt": ["shortlog", "-sn", tip],
-                "changes.stat.txt": ["log", "--no-decorate", "--format=fuller",
-                                     "--stat", "--root", tip],
-            }
-            for filename, args in exports.items():
-                with (dest / filename).open("wb") as stream:
-                    run_git(bare, *args, output=stream)
-            bundle = dest / "history.bundle"
-            run_git(bare, "bundle", "create", str(bundle), ref)
-            run_git(bare, "bundle", "verify", str(bundle))
-            with (dest / "commits.sha.txt").open("rb") as stream:
-                if sum(1 for _ in stream) != count:
-                    raise RuntimeError("Commit count mismatch")
-            record = dict(branch=name, ref=ref, tip=tip, roots=roots,
-                          commit_count=count, directory="branches/" + folder)
-            write_json(dest / "manifest.json", record)
-            records.append(record)
-        manifest = dict(repository=canonical,
-                        generated_at=datetime.now(timezone.utc).isoformat(),
-                        branch_count=len(records), branches=records,
-                        scope="All ancestors of visible branch tips; no LFS or submodule objects")
-        write_json(pack / "manifest.json", manifest)
-        lines = ["# GitHub Branch History", "", canonical, "",
-                 "Branches: " + str(len(records)), ""]
-        for record in records:
-            # JSON quoting preserves exact names without table escaping ambiguities.
-            lines.append("- " + json.dumps(record["branch"], ensure_ascii=True)
-                         + ": " + str(record["commit_count"]) + " commits; "
-                         + record["directory"])
-        (pack / "SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        checksums = {}
-        for path in sorted(pack.rglob("*")):
-            if path.is_file():
-                checksums[path.relative_to(pack).as_posix()] = digest(path)
-        write_json(pack / "SHA256SUMS.json", checksums)
-        archive = run_dir / "history.zip"
-        with ZipFile(archive, "w", ZIP_DEFLATED, allowZip64=True) as zipped:
-            for path in sorted(pack.rglob("*")):
-                if path.is_file():
-                    zipped.write(path, path.relative_to(run_dir).as_posix())
-        with ZipFile(archive) as zipped:
-            if zipped.testzip() is not None:
-                raise RuntimeError("ZIP integrity check failed")
-            for relative, expected in checksums.items():
-                actual = hashlib.sha256()
-                with zipped.open("history/" + relative) as stream:
-                    for block in iter(lambda: stream.read(1024 * 1024), b""):
-                        actual.update(block)
-                if actual.hexdigest() != expected:
-                    raise RuntimeError("Archive checksum mismatch")
-        checksum = run_dir / "history.zip.sha256"
-        checksum.write_text(digest(archive) + "  history.zip\n", encoding="ascii")
-        write_json(run_dir / "SUCCESS.json", dict(archive=str(archive), **manifest))
-        print(json.dumps(dict(archive=str(archive), checksum=str(checksum),
-                              summary=str(pack / "SUMMARY.md"),
-                              branch_count=len(records)), indent=2))
-        return run_dir
-
-if __name__ == "__main__":
-    if len(sys.argv) not in (2, 3):
-        raise SystemExit("Usage: python3 collect.py GITHUB_URL [OUT_DIR]")
-    collect(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else "out")
+summary_tmp="$pack_root/.summary.tmp"
+printf '# GitHub All Branches Commit Pack\n\n| Branch | From | To | Commits | Directory |\n|---|---|---|---:|---|\n' > "$summary_tmp"
+for branch in "${branches[@]}"; do
+  ref="refs/remotes/origin/$branch"
+  git show-ref --verify --quiet "$ref" || ref="refs/heads/$branch"
+  to_sha="$(git -C "$repo_root" rev-parse "$ref")"
+  from_sha="$(git -C "$repo_root" rev-list --max-parents=0 "$to_sha" | tail -n 1)"
+  commit_count="$(git -C "$repo_root" rev-list --count "$to_sha")"
+  safe_branch="$(printf '%s' "$branch" | sed 's#[^A-Za-z0-9._-]#_#g; s#^[.-]*$#branch#')"
+  branch_dir="$branches_root/$safe_branch"
+  mkdir -p "$branch_dir"
+  git -C "$repo_root" log --oneline "$to_sha" > "$branch_dir/commits.oneline.txt"
+  git -C "$repo_root" log --pretty=fuller "$to_sha" > "$branch_dir/commits.full.txt"
+  git -C "$repo_root" shortlog -sn "$to_sha" > "$branch_dir/authors.txt"
+  printf 'from=%s\nto=%s\n' "$from_sha" "$to_sha" > "$branch_dir/range.txt"
+  if git -C "$repo_root" diff --stat "$from_sha" "$to_sha" > "$branch_dir/diff.stat.txt"; then :; else printf 'diff unavailable; retained commit logs and range only\n' > "$branch_dir/diff.stat.txt"; fi
+  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  {
+    printf 'branch: %s\nfrom: %s\nto: %s\ncommit_count: %s\ngenerated_at: %s\nfiles:\n' "$branch" "$from_sha" "$to_sha" "$commit_count" "$generated_at"
+    printf '  - commits.oneline.txt\n  - commits.full.txt\n  - diff.stat.txt\n  - authors.txt\n  - range.txt\n  - pack-manifest.yaml\n'
+  } > "$branch_dir/pack-manifest.yaml"
+  if [[ "$MAKE_TARBALLS" == 1 ]]; then
+    tar -czf "$branches_root/$safe_branch.tar.gz" -C "$branches_root" "$safe_branch"
+  fi
+  printf '| `%s` | `%s` | `%s` | %s | `branches/%s` |\n' "$branch" "$from_sha" "$to_sha" "$commit_count" "$safe_branch" >> "$summary_tmp"
+done
+mv "$summary_tmp" "$pack_root/SUMMARY.md"
+printf 'Wrote %s\n' "$pack_root"
 ```
 
 ## 成功标准
 
-- SUCCESS.json 只在所有分支、bundle 校验、ZIP 完整性和逐文件 SHA-256 校验通过后生成。
-- 顶层 manifest 保留采集时间、仓库规范地址、全部分支与目录的映射。
-- 每个分支 manifest 包含分支名、tip、全部根提交、commit_count。
-- 每个分支完整 SHA 列表行数等于 Git rev-list --count；history.bundle 可用于恢复对应分支的 Git 历史。
-- 最终 ZIP 按 branches/branch-000001 等目录分隔分支，有 SUMMARY 和校验清单。
-- 任意 Git 或压缩校验失败都不是成功；保留本次未完成目录供诊断，重试生成新目录。
+- [ ] `out/<repo-name>/SUMMARY.md` 存在且列出每个发现的分支及 commit_count。
+- [ ] 每个 `out/<repo-name>/branches/<branch-safe-name>/` 独立存在，并含 `commits.oneline.txt`、`commits.full.txt`、`diff.stat.txt`、`authors.txt`、`range.txt` 和 `pack-manifest.yaml`。
+- [ ] manifest 的 `from`、`to`、`commit_count` 与 Git 命令结果一致；tarball（若启用）可由 `tar -tzf` 读取。
 
 ## 安全
 
-- 只使用用户有权访问的仓库，不绕过认证。不执行仓库代码、hooks、构建或子模块命令。
-- Git bundle 包含历史提交中的全部被跟踪内容，可能包括曾经提交的凭据或个人信息。不能声称其天然脱敏；交付给仓库授权用户，未经明确授权不得对外上传。
-- URL 禁止凭据、query、fragment 或非 GitHub 主机。不得要求用户在聊天中提供令牌。
-- 临时 bare 仓库通过 TemporaryDirectory 自动清理，只清理本流程创建的临时目录；不接触用户已有仓库。
-- 输出路径拒绝 ..，每次新目录，不覆盖旧产物。分支名只写入数据，不作为路径或 shell 代码。
-- 保持普通 Git 服务约束，不绕过限流；网络、权限或磁盘失败按失败报告。
+- 不打包 `.env`、密钥、证书私钥或其他凭据；本流程只写 Git 元数据和统计文本，不复制工作树文件。
+- 不删除用户未确认的目录；已有 `repo_path` 仅读取并执行 fetch，不清理其内容。
+- clone 仅允许写入 `out_dir/.repos/`；`out_dir` 和仓库路径须由调用者明确提供或使用默认工作目录下的 `out`。
+- 分支名经过文件系统安全替换；不要把未经替换的分支名拼接为路径。
+- 不要把访问令牌写入 URL、日志或产物；私有仓库认证应由 Git credential helper 或 SSH agent 提供。
+
+## 输出给用户的汇报
+
+- 报告 `SUMMARY.md`、分支目录和可选 tarball 的绝对路径。
+- 报告分支总数及每个分支的 commit_count。
+- 若 fetch、diff 或单个分支失败，保留已完成产物并说明失败命令及可执行的重试建议。
