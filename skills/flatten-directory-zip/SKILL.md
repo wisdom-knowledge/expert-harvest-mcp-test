@@ -1,31 +1,91 @@
 ---
 name: flatten-directory-zip
-version: 0.1.0
+version: 0.2.0
 kind: flow-skill
-tags: [files, directory, flatten, zip, archive]
-summary: Flatten every file under a directory into one output directory and package the result as a ZIP archive.
+interaction: stepwise
+tags: [files, directory, flatten, zip, archive, interactive]
+summary: 用户只凭邀请码进入会话；逐步询问源目录等参数后，将目录内文件扁平化并打成 ZIP。
 ---
 
 # Flatten Directory and Create ZIP
 
 ## 目标
 
-给定一个输入目录，递归读取它和所有子目录中的文件，把文件复制到同一个输出目录，再将这个扁平目录打包成 ZIP。输入目录本身不会被修改。
+把某个本机目录下（含所有子目录）的文件，复制到同一层输出目录，再打成 ZIP。  
+**不修改**用户的输入目录。同名冲突默认失败；可选 rename。
 
-默认保留输入目录直属文件的文件名，并把子目录中的文件也放到同一层。为避免静默覆盖，同名文件默认使流程失败；如业务允许，可以使用 `collision_mode=rename` 为冲突文件追加稳定的 `__2`、`__3` 后缀。
+## 用户怎么进入
 
-## 输入
+```text
+邀请码 <本流程的 invite>
+```
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `input_dir` | 是 | 要采集的目录；必须是目录，不能是输出目录的父子重叠路径 |
-| `output_dir` | 否 | 扁平文件和 ZIP 的输出目录，默认 `$PWD/flattened-output` |
-| `zip_name` | 否 | ZIP 文件名，默认 `flattened-files.zip`；必须是普通文件名，不能包含 `/` 或 `..` |
-| `collision_mode` | 否 | `error`（默认）或 `rename` |
+Agent 加载本 Skill 后进入交互：一次只问一个问题，确认后再执行。不要把全文或整段 bash 甩给用户。
 
-## 执行步骤（必须按序）
+## 交互步骤（槽位 · 必须按序）
 
-在包含 Bash、`find`、`cp`、`mkdir`、`mv`、`rm` 和 `zip` 的环境中执行。脚本不依赖 Bash 4 的关联数组，并使用 NUL 分隔的文件列表，因此文件名中的空格、换行和引号不会改变遍历边界。
+### 步骤 1 · 源目录
+
+| 项 | 内容 |
+|----|------|
+| 问法 | 「请给我要处理的源目录路径（本机绝对路径或可解析路径）：」 |
+| 槽位 | `input_dir` |
+| 必填 | 是 |
+| 默认 | 无 |
+| 校验 | 必须是已存在的目录；不能是 `/`、不能是 `.ssh` 等敏感目录；不能与即将使用的 output_dir 重叠 |
+| 示例回答 | `/Users/me/Desktop/my-folder` |
+
+### 步骤 2 · 输出目录
+
+| 项 | 内容 |
+|----|------|
+| 问法 | 「输出目录用哪里？直接回复「默认」则用当前目录下的 `flattened-output`」 |
+| 槽位 | `output_dir` |
+| 必填 | 否 |
+| 默认 | `$PWD/flattened-output` |
+| 校验 | 不得等于 input_dir，不得位于 input_dir 之内；不可写则重问 |
+| 示例回答 | `默认` 或 `~/Desktop/flat-out` |
+
+### 步骤 3 · ZIP 文件名
+
+| 项 | 内容 |
+|----|------|
+| 问法 | 「ZIP 叫什么名字？回复「默认」则用 `flattened-files.zip`」 |
+| 槽位 | `zip_name` |
+| 必填 | 否 |
+| 默认 | `flattened-files.zip` |
+| 校验 | 普通文件名，不能含 `/` 或 `..` |
+| 示例回答 | `默认` 或 `my-pack.zip` |
+
+### 步骤 4 · 重名策略
+
+| 项 | 内容 |
+|----|------|
+| 问法 | 「遇到同名文件时：1) 报错停止  2) 自动改名保留。请回复 1 或 2（默认 1）」 |
+| 槽位 | `collision_mode` |
+| 必填 | 否 |
+| 默认 | `error`（用户回 1 或「默认」） |
+| 校验 | `1`/`报错` → error；`2`/`改名` → rename |
+| 示例回答 | `1` |
+
+## 确认词
+
+槽位齐后复述：
+
+```text
+即将扁平化并打包：
+- input_dir: …
+- output_dir: …
+- zip_name: …
+- collision_mode: error|rename
+确认开始？回复「确认」或指出要改的项。
+```
+
+确认词：`确认` / `开始` / `OK`。说「改源目录」等则回到对应步骤。
+
+## 执行步骤（确认后 · 本机）
+
+在包含 Bash、`find`、`cp`、`mkdir`、`mv`、`rm` 和 `zip` 的环境中执行。
 
 ```bash
 set -euo pipefail
@@ -102,23 +162,21 @@ printf 'files=%s\noutput_dir=%s\narchive=%s\nmanifest=%s\n' "$count" "$output_di
 
 ## 成功标准
 
-- [ ] 输出目录包含一个扁平文件目录对应的 ZIP，且 ZIP 通过 `unzip -tq` 校验。
-- [ ] ZIP 中每个条目都位于根层，不含输入目录前缀或子目录路径。
-- [ ] `flatten-manifest.tsv` 记录每个输出文件名及其输入相对路径，便于追溯。
-- [ ] `collision_mode=error` 时任何扁平化后的同名文件都会使流程失败，不会覆盖已有文件。
-- [ ] `collision_mode=rename` 时冲突文件保留，重命名结果使用从 `__2` 开始的稳定编号。
+- [ ] 用户主要通过邀请码 + 逐步短答完成（或首句已带齐路径）
+- [ ] 输出目录含通过 `unzip -tq` 的 ZIP，条目均在根层
+- [ ] 存在 `flatten-manifest.tsv` 追溯输出名→输入相对路径
+- [ ] `collision_mode=error` 时同名即失败；`rename` 时用 `__2` 起稳定后缀
 
 ## 安全
 
-- 不删除或移动输入目录中的文件；只执行带 `--` 的复制和归档操作。
-- 拒绝把输出目录放在输入目录中，避免输出文件被下一次递归扫描。
-- ZIP 文件名只允许普通文件名，拒绝 `/`、`..` 和空值，防止路径穿越。
-- 不跟随符号链接收集文件；不会把 `.git` 目录中的文件写入归档。
-- 不把文件内容、凭据或环境变量写入日志；manifest 只包含文件名和输入相对路径。
-- 输出 ZIP 已存在时会覆盖该 ZIP，但不会覆盖扁平目录中的输入文件；需要保留旧归档时请先改用不同的 `zip_name`。
+- 不删除或移动输入目录中的文件；只复制和归档
+- 拒绝 output 落在 input 内，避免扫描到输出
+- ZIP 名禁止路径穿越；不跟符号链接收集；跳过 `.git`
+- 不把文件内容/密钥写入日志；manifest 仅文件名与相对路径
+- 交互中拒绝系统根、`.ssh` 等危险源路径
 
 ## 输出给用户的汇报
 
-- 报告 `archive` 和 `manifest` 的绝对路径。
-- 报告收集的文件数量及使用的 `collision_mode`。
-- 若发现同名文件、输入目录为空、路径重叠或 ZIP 校验失败，报告失败原因和修复参数；不要把部分结果当作成功交付。
+- `archive` 与 `manifest` 的绝对路径
+- 文件数量与 `collision_mode`
+- 失败时说明是哪一交互步或执行步，并给出可重试短提示（不甩长 log）
